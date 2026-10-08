@@ -1,7 +1,7 @@
 #!/bin/sh
 # monitor hub installer.
 #
-#   curl -fsSL https://github.com/monitor-probe/monitor/releases/latest/download/install-hub.sh -o install-hub.sh
+#   curl -fsSL https://github.com/white-u/monitor/releases/latest/download/install-hub.sh -o install-hub.sh
 #   chmod +x install-hub.sh
 #   sudo ./install-hub.sh
 #
@@ -14,7 +14,7 @@ set -eu
 # Debian does not set it.
 PATH="$PATH:/usr/sbin:/sbin"
 
-REPO="monitor-probe/monitor"
+REPO="white-u/monitor"
 SERVICE="monitor-hub"
 UNIT="/etc/systemd/system/monitor-hub.service"
 # Everything but the unit lives under one directory: the two binaries at the top,
@@ -478,7 +478,7 @@ hub 只监听 127.0.0.1，公网访问不到，需要自己配 nginx / caddy / C
 重跑一次就是升级：校验通过后才替换二进制，起不来会自动回滚到上一版；
 没写的参数沿用上次的，所以升级不会把端口和 --site 冲掉。
 这份脚本不是最新发布的那一版时，会先把自己换成新版再接着装。
-二进制和数据都在 $ROOT 下（数据库和主题在 $DATA），卸载默认保留数据。
+二进制和数据都在 $ROOT 下（数据库和主题在 ${DATA}），卸载默认保留数据。
 TXT
 }
 

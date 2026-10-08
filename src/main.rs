@@ -158,7 +158,7 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
 /// settings: redirecting either implies a fork, which rebuilds these lines
 /// anyway.
 pub const AGENT_REPO: &str = "monitor-probe/agent";
-pub const HUB_REPO: &str = "monitor-probe/monitor";
+pub const HUB_REPO: &str = "white-u/monitor";
 
 /// The one-line installer pasted onto a new VPS.
 async fn install_script() -> Response {

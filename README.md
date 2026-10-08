@@ -14,6 +14,17 @@
 
 分时流量按采样当时的 hub 本地时间记账，跨时段采样和断报补记归后一次采样所在时段，无法精确还原实际时间分布。旧每日累计不拆分回填，没有记录的时段显示「未记录」。本 fork 使用独立扩展表，不占用上游数据库迁移编号。
 
+## 安装本 fork
+
+发布 Release 后，在使用 systemd 的 Linux 服务器上运行：
+
+```sh
+curl -fsSL https://github.com/white-u/monitor/releases/latest/download/install-hub.sh -o install-hub.sh
+sudo sh install-hub.sh --yes --site https://monitor.example.com
+```
+
+将 `monitor.example.com` 换成你的 HTTPS 域名，并配置反向代理到 `127.0.0.1:28080`。hub 的安装和更新检查使用 `white-u/monitor`，agent 和默认主题继续使用上游版本。在后台添加本机节点，复制生成的 agent 安装命令到同一台服务器执行即可。
+
 ## 组成
 
 | 仓库 | 说明 |
