@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
@@ -355,6 +355,42 @@ pub struct Window {
 
 fn default_hours() -> i64 {
     6
+}
+
+#[derive(Deserialize)]
+pub struct PeriodWindow {
+    #[serde(default = "default_period_days")]
+    days: i64,
+}
+
+fn default_period_days() -> i64 {
+    7
+}
+
+pub async fn traffic_periods(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+    query: Result<Query<PeriodWindow>, QueryRejection>,
+) -> Response {
+    let Ok(Query(window)) = query else { return bad("流量历史天数格式不对") };
+    if !(1..=db::MAX_RETENTION_DAYS).contains(&window.days) {
+        return bad("流量历史天数要在 1 到 365 之间");
+    }
+    match app.db.node(id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return no_such_node(),
+        Err(e) => return fail(e),
+    }
+    let Ok(_permit) = HISTORY_GATE.try_acquire() else {
+        return answer(StatusCode::SERVICE_UNAVAILABLE, "查询历史的请求太多，稍后再试");
+    };
+    let now = Local::now();
+    let report = tokio::task::spawn_blocking(move || app.db.traffic_periods(id, window.days, now)).await;
+    match report.map_err(anyhow::Error::from).and_then(|r| r) {
+        Ok(report) => ([(header::CACHE_CONTROL, "no-store, no-transform")], Json(report)).into_response(),
+        Err(e) => fail(e),
+    }
 }
 
 /// How many history windows are built concurrently.
@@ -2232,6 +2268,46 @@ mod tests {
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
+    }
+
+    #[tokio::test]
+    async fn period_history_requires_admin_and_reports_actual_retention() {
+        let _serial = HISTORY_TESTS.lock().await;
+        let app = std::sync::Arc::new(app());
+        let mut parts = axum::http::Request::new(()).into_parts().0;
+        let rejected = Admin::from_request_parts(&mut parts, &app).await.err().unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        app.db.create_session(&sha256("session"), Utc::now().timestamp() + 3600).unwrap();
+        parts.headers.insert(header::COOKIE, "monitor_session=session".parse().unwrap());
+        assert!(Admin::from_request_parts(&mut parts, &app).await.is_ok());
+        let id = app.db.create_node(&Node { name: "n".into(), ..Default::default() }, "token").unwrap();
+        app.db.set("retention_days", "3").unwrap();
+        for days in [-1, 0, 366] {
+            let response =
+                traffic_periods(Admin, State(app.clone()), Path(id), Ok(Query(PeriodWindow { days }))).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        for days in ["all", "invalid", "1.5"] {
+            let query = Query::<PeriodWindow>::try_from_uri(
+                &format!("/api/nodes/{id}/traffic/periods?days={days}").parse().unwrap(),
+            );
+            let response = traffic_periods(Admin, State(app.clone()), Path(id), query).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response =
+            traffic_periods(Admin, State(app.clone()), Path(id + 1), Ok(Query(PeriodWindow { days: 7 })))
+                .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response =
+            traffic_periods(Admin, State(app.clone()), Path(id), Ok(Query(PeriodWindow { days: 365 }))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store, no-transform");
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let report: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(report["days"], 3);
+        assert_eq!(report["rows"].as_array().unwrap().len(), 3);
+        assert_eq!(report["today"], Local::now().date_naive().to_string());
+        assert!(report["summary"].is_null());
     }
 
     /// Taken by every test that calls `metrics`. `HISTORY_GATE` is process-wide,

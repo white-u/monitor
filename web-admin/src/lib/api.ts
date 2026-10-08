@@ -89,6 +89,24 @@ export type Node = {
 
 export type PingTask = { id: number; name: string; target: string; interval: number; nodes: number[]; auto_join: boolean }
 
+export type TrafficBytes = { rx: number; tx: number; total: number }
+export type TrafficPeriodRow = {
+  day: string
+  periods: [TrafficBytes | null, TrafficBytes | null, TrafficBytes | null, TrafficBytes | null]
+  total: TrafficBytes | null
+}
+export type TrafficPeriods = {
+  today: string
+  current_slot: number
+  utc_offset_seconds: number
+  retention_days: number
+  days: number
+  since: string
+  until: string
+  rows: TrafficPeriodRow[]
+  summary: TrafficBytes | null
+}
+
 /** Every group in use, in the order of the first node carrying it: the node order decides the group order. */
 export function groupsOf(nodes: Pick<Node, "group">[]): string[] {
   return [...new Set(nodes.map((n) => n.group ?? "").filter(Boolean))]

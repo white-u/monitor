@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::RuntimeFlavor;
 use tracing::info;
 
+use crate::traffic_period;
+
 pub struct Db {
     /// A read-only connection to the same file, for the history charts. A week
     /// of one node's probe results is a scan of 98 ms at four 60-second probes
@@ -979,6 +981,7 @@ impl Db {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         migrate(&conn, if fresh { SCHEMA_VERSION } else { version })?;
+        traffic_period::ensure(&conn)?;
         let reader = match main_file(&conn) {
             file if file.is_empty() => None,
             file => Some(Mutex::new(read_only(&file)?)),
@@ -1428,7 +1431,9 @@ impl Db {
         (rx, tx): (i64, i64),
         at: DateTime<Local>,
     ) -> Result<Traffic> {
-        let conn = self.conn();
+        let keep = self.retention_days();
+        let mut conn = self.conn();
+        let transaction = conn.transaction()?;
         let (
             prev_boot,
             last_rx,
@@ -1442,7 +1447,7 @@ impl Db {
             mut day_tx,
             day_start,
             reset_day,
-        ) = conn
+        ) = transaction
             .prepare_cached(
                 "SELECT t.boot_id, t.last_rx, t.last_tx, t.total_rx, t.total_tx, t.month_rx, t.month_tx,
                     t.month_start, t.day_rx, t.day_tx, t.day_start, n.traffic_reset_day
@@ -1536,14 +1541,27 @@ impl Db {
             day_tx = d_tx;
         }
 
-        conn.prepare_cached(
-            "UPDATE traffic SET boot_id=?2, last_rx=?3, last_tx=?4, total_rx=?5, total_tx=?6,
+        transaction
+            .prepare_cached(
+                "UPDATE traffic SET boot_id=?2, last_rx=?3, last_tx=?4, total_rx=?5, total_tx=?6,
                             month_rx=?7, month_tx=?8, month_start=?9, day_rx=?10, day_tx=?11,
                             day_start=?12 WHERE node_id=?1",
-        )?
-        .execute(params![
-            node_id, boot_id, rx, tx, total_rx, total_tx, month_rx, month_tx, period, day_rx, day_tx, day
-        ])?;
+            )?
+            .execute(params![
+                node_id, boot_id, rx, tx, total_rx, total_tx, month_rx, month_tx, period, day_rx, day_tx, day
+            ])?;
+        // A first reading establishes a baseline, not a measured zero. A later
+        // zero delta is still an observation. Use the sampling date and hour
+        // together; the mutable day counter above may clamp its own date.
+        if !prev_boot.is_empty()
+            && prev_boot == boot_id
+            && ((rx >= last_rx && tx >= last_tx) || d_rx > 0 || d_tx > 0)
+            && date >= traffic_period::since(today, keep)
+            && date <= today
+        {
+            traffic_period::record(&transaction, node_id, at, (d_rx, d_tx))?;
+        }
+        transaction.commit()?;
         Ok(Traffic { total_rx, total_tx, month_rx, month_tx, month_start: period, day_rx, day_tx })
     }
 
@@ -1573,6 +1591,16 @@ impl Db {
             params![node_id, p.total_rx, p.total_tx, p.month_rx, p.month_tx, period],
         )?;
         Ok(true)
+    }
+
+    pub fn traffic_periods(
+        &self,
+        node: i64,
+        days: i64,
+        now: DateTime<Local>,
+    ) -> Result<traffic_period::Report> {
+        let retention = self.retention_days();
+        traffic_period::read(&self.reader(), node, days, retention, now)
     }
 
     // ---- metrics ----
@@ -1835,6 +1863,7 @@ impl Db {
     /// and the minute rows it guards, between two of them.
     pub fn prune(&self, keep_days: i64) -> Result<usize> {
         let now = Utc::now().timestamp();
+        let period_since = traffic_period::since(Local::now().date_naive(), keep_days);
         let nodes: Vec<i64> = self
             .conn()
             .prepare_cached("SELECT id FROM node")?
@@ -1867,6 +1896,9 @@ impl Db {
                     drop(conn);
                     let_waiters_in();
                 }
+            }
+            if !halted() {
+                pruned += traffic_period::prune(&self.conn(), id, period_since)?;
             }
         }
         Ok(pruned)
@@ -2322,6 +2354,12 @@ impl Db {
             let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
             rows.insert(table.to_owned(), serde_json::json!(n));
         }
+        rows.insert(
+            traffic_period::TABLE.to_owned(),
+            serde_json::json!(
+                conn.query_row("SELECT COUNT(*) FROM fork_traffic_period", [], |r| r.get::<_, i64>(0))?
+            ),
+        );
         Ok(serde_json::json!({
             "path": file,
             "size": bytes_of(&file),
@@ -2443,10 +2481,6 @@ impl Db {
         // arrangement in which the restore has failed and the original data is
         // also gone.
         migrate(&candidate, version)?;
-        // The migration lands in a -wal beside a backup taken from a running hub.
-        // Checkpointed here so the copy below reads a single file.
-        let _ = candidate.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
-
         // Table names are not a schema. Pages are copied verbatim, so the columns
         // the file carries become the ones this hub's statements run against, and
         // eight correctly named tables holding the wrong columns pass every gate
@@ -2469,6 +2503,9 @@ impl Db {
                 refuse!("{NOT_A_BACKUP}：{table} 表缺少字段 {}", missing.join("、"));
             }
         }
+        traffic_period::ensure(&candidate)?;
+        // The extension may have just been created on an old WAL backup.
+        let _ = candidate.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
         Ok(())
     }
 
@@ -4208,3 +4245,7 @@ mod tests {
         save(first, vec![id]).expect("an existing probe can still be edited at the cap");
     }
 }
+
+#[cfg(test)]
+#[path = "testdata/traffic-period.rs"]
+mod traffic_period_tests;

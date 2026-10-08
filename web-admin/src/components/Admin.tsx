@@ -1,11 +1,12 @@
 import { memo, useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
+import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, GripVertical, History, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
+import { TrafficHistory } from "@/components/TrafficHistory"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -1581,6 +1582,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
+  const [trafficHistory, setTrafficHistory] = useState<Node | null>(null)
   const [installing, setInstalling] = useState<Node | null>(null)
   const [registering, setRegistering] = useState(false)
   const reg = useRegisterWindow()
@@ -1731,6 +1733,11 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                   <span className="whitespace-nowrap text-muted-foreground">
                     / {n.traffic_limit > 0 ? bytes(n.traffic_limit) : FOREVER}
                   </span>
+                  <div>
+                    <Button variant="ghost" size="sm" className="h-7 px-1.5 text-xs text-muted-foreground" onClick={() => setTrafficHistory(n)}>
+                      <History className="size-3.5" /> 历史
+                    </Button>
+                  </div>
                 </TableCell>
                 <TableCell className="tnum text-sm">
                   {n.price > 0 ? money(n.price, n.currency) : "免费"}
@@ -1789,6 +1796,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       {billing && (
         <BillingForm node={billing} onClose={() => setBilling(null)} onSaved={refresh} />
       )}
+      {trafficHistory && <TrafficHistory node={trafficHistory} onClose={() => setTrafficHistory(null)} />}
       {registering && <RegisterDialog site={site} reg={reg} onClose={() => { setRegistering(false); refresh() }} />}
 
       {installing && (
@@ -3298,6 +3306,7 @@ type DbInfo = {
 const DB_ROWS: [string, string][] = [
   ["metric", "历史明细"],
   ["metric_hour", "历史小时汇总"],
+  ["fork_traffic_period", "分时流量记录"],
   ["ping_record", "延迟记录"],
   ["ping_hour", "延迟小时汇总"],
 ]

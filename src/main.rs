@@ -30,6 +30,7 @@ mod auth;
 mod db;
 mod frontend;
 mod notify;
+mod traffic_period;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -489,6 +490,7 @@ async fn main() -> Result<()> {
         .route("/api/me", get(api::me))
         .route("/api/nodes", get(api::nodes))
         .route("/api/nodes/{id}/metrics", get(api::metrics))
+        .route("/api/nodes/{id}/traffic/periods", get(api::traffic_periods))
         .route("/api/ws", get(api::live_ws))
         .route("/api/themes/{short}/config", get(api::theme_config))
         // Sign-in.
