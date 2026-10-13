@@ -284,20 +284,27 @@ struct Rpc {
     params: serde_json::Value,
 }
 
+/// The node a request's bearer token belongs to, or the 401 text. The same
+/// text whether the token is malformed or merely unknown.
+fn authenticate(app: &App, headers: &HeaderMap) -> Result<i64, &'static str> {
+    let token = bearer(headers).ok_or("missing token")?;
+    match app.db.node_by_token(token) {
+        Ok(Some(id)) => Ok(id),
+        _ => Err("invalid token"),
+    }
+}
+
 pub async fn handler(
     State(app): State<Shared>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let Some(token) = bearer(&headers) else {
-        return crate::api::answer(StatusCode::UNAUTHORIZED, "missing token");
+    let node_id = match authenticate(&app, &headers) {
+        Ok(id) => id,
+        Err(refusal) => return crate::api::answer(StatusCode::UNAUTHORIZED, refusal),
     };
-    let Ok(Some(node_id)) = app.db.node_by_token(token) else {
-        // The same response whether the token is malformed or merely unknown.
-        return crate::api::answer(StatusCode::UNAUTHORIZED, "invalid token");
-    };
-    let ip = node_ip(&headers, peer.ip()).to_string();
+    let ip = node_ip(&app, &headers, peer.ip()).to_string();
 
     upgrade.read_buffer_size(crate::api::SOCKET_BUFFER).max_message_size(crate::api::MAX_FRAME).on_upgrade(
         move |socket| async move {
@@ -306,6 +313,38 @@ pub async fn handler(
             }
         },
     )
+}
+
+/// A glimpse rather than a session: an agent whose session runs over one
+/// address family connects here over the other, so the hub can record the
+/// address it appears at there. An interface holding only a private address of
+/// that family -- NAT66, a ULA behind a masquerading host -- says nothing of
+/// where it exits, and the session, arriving in one family, cannot.
+///
+/// A route of its own rather than a query on the session's: a hub from before
+/// this one would take `?echo` for a session, retire the live one, and flap the
+/// node on every connect, where it answers an unknown path with 404 and the
+/// agent goes without. Authenticated like a session, so no anonymous path, and
+/// it opens none: whatever is running is left alone.
+pub async fn echo(
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let node_id = match authenticate(&app, &headers) {
+        Ok(id) => id,
+        Err(refusal) => return crate::api::answer(StatusCode::UNAUTHORIZED, refusal),
+    };
+    // A proxy that wrote nothing leaves the proxy's own address here, which
+    // would replace an exit recorded earlier with one the panel never shows.
+    let ip = node_ip(&app, &headers, peer.ip());
+    if public(ip) {
+        if let Err(e) = app.db.set_ip_other(node_id, &ip.to_string()) {
+            warn!("node {node_id}: storing the address seen in the other family failed: {e:#}");
+        }
+    }
+    upgrade.on_upgrade(|_| async {})
 }
 
 /// Extracts the node token from `Authorization: Bearer <token>`.
@@ -858,6 +897,22 @@ mod tests {
                 &crate::auth::random_token(),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn a_token_opens_the_route_only_for_its_node() {
+        let app = app();
+        let token = crate::auth::random_token();
+        let id = app.db.create_node(&Node { name: "n".into(), ..Default::default() }, &token).unwrap();
+        let with = |value: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("authorization", value.parse().unwrap());
+            h
+        };
+        assert_eq!(authenticate(&app, &with(&format!("Bearer {token}"))).ok(), Some(id));
+        for refused in [HeaderMap::new(), with("Bearer nope"), with("Basic abc")] {
+            assert!(authenticate(&app, &refused).is_err());
+        }
     }
 
     /// A connected agent, the precondition for filing any report: the session

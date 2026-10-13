@@ -14,6 +14,17 @@ use tracing::info;
 
 use crate::traffic_period;
 
+/// A string an agent reported, cut down to what may be shown. Control
+/// characters break the panel's rows, and the characters markup is made of are
+/// dropped because the value reaches a theme from a machine nobody has vouched
+/// for: a theme that sets it as HTML would otherwise run a node's script in the
+/// hub's origin, beside the administrator's session. No real OS name, kernel,
+/// CPU model or host name contains any of them. `chars()` rather than bytes, so
+/// the cut falls on a character boundary.
+pub fn reported_text(raw: &str, max: usize) -> String {
+    raw.chars().filter(|c| !c.is_control() && !matches!(c, '<' | '>' | '"' | '\'')).take(max).collect()
+}
+
 pub struct Db {
     /// A read-only connection to the same file, for the history charts. A week
     /// of one node's probe results is a scan of 98 ms at four 60-second probes
@@ -74,6 +85,11 @@ CREATE TABLE IF NOT EXISTS node (
   swap_total INTEGER NOT NULL DEFAULT 0, disk_total INTEGER NOT NULL DEFAULT 0,
   agent_version TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '',
   ipv4 TEXT NOT NULL DEFAULT '', ipv6 TEXT NOT NULL DEFAULT '',
+  -- Where the hub saw the node in the address family `ip` is not in, from the
+  -- short connection an agent makes over it (`agent_ws::echo`).
+  -- Empty until one has arrived, and left as it was when none does: the family
+  -- it belongs to must still be held on an interface for it to be shown.
+  ip_other TEXT NOT NULL DEFAULT '',
   -- ISO 3166-1 alpha-2, looked up from `country_ip` once per address. Empty
   -- until the lookup answers, and empty is what a node whose country nobody
   -- could tell stays: the public page just leaves the badge off.
@@ -222,7 +238,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -395,6 +411,10 @@ fn migrate_to_12(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "public_remark TEXT NOT NULL DEFAULT ''")
 }
 
+fn migrate_to_13(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "ip_other TEXT NOT NULL DEFAULT ''")
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -443,6 +463,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 12 {
         migrate_to_12(&tx)?;
+    }
+    if from < 13 {
+        migrate_to_13(&tx)?;
     }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
@@ -523,6 +546,10 @@ pub struct Node {
     pub agent_version: String,
     #[serde(default)]
     pub ip: String,
+    /// Likewise the address the hub saw, in the family `ip` is not; see the
+    /// column.
+    #[serde(default)]
+    pub ip_other: String,
     /// Reported by the agent from its own interfaces, unlike `ip`, which is
     /// merely the address the agent's connection originated from.
     #[serde(default)]
@@ -1258,23 +1285,12 @@ impl Db {
     /// moves to `country_prev_ip` / `country_prev` if it had an answer, and a
     /// source equal to that address takes its answer back without a lookup.
     pub fn save_facts(&self, id: i64, f: &serde_json::Value, ip: &str, source: &str) -> Result<bool> {
-        // The same rule `api::agent_register` applies to the name it receives:
-        // these values come from an unvouched machine, control characters break
-        // the panel's rows, and the length must be bounded. Six of them -- os,
-        // kernel, arch, virt, cpu_name, agent_version -- go straight into the
-        // anonymous public frame, which is rebuilt and pushed to every viewer
-        // every two seconds, so without a ceiling one node would determine that
-        // frame's size. 128 rather than 64: a real PRETTY_NAME runs to about 60
-        // characters and a CPU model to about 50.
-        let s = |k: &str| {
-            f.get(k)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(128)
-                .collect::<String>()
-        };
+        // Six of these -- os, kernel, arch, virt, cpu_name, agent_version -- go
+        // straight into the anonymous public frame, which is rebuilt and pushed to
+        // every viewer every two seconds, so without a ceiling one node would
+        // determine that frame's size. 128 rather than 64: a real PRETTY_NAME runs
+        // to about 60 characters and a CPU model to about 50.
+        let s = |k: &str| reported_text(f.get(k).and_then(|v| v.as_str()).unwrap_or(""), 128);
         let n = |k: &str| f.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
         let conn = self.conn();
         conn.execute(
@@ -1309,6 +1325,16 @@ impl Db {
         )?;
         let blank: bool = conn.query_row("SELECT country = '' FROM node WHERE id=?1", [id], |r| r.get(0))?;
         Ok(blank && !source.is_empty())
+    }
+
+    /// Records where the hub saw a node over the address family its session is
+    /// not in. Kept apart from `save_facts`, which an agent's hello rewrites: the
+    /// two arrive on different connections, in no fixed order.
+    pub fn set_ip_other(&self, id: i64, ip: &str) -> Result<()> {
+        // Unchanged is not written: a reconnecting agent, or a token holder
+        // repeating the request, would otherwise cost a write transaction each.
+        self.conn().execute("UPDATE node SET ip_other=?2 WHERE id=?1 AND ip_other<>?2", params![id, ip])?;
+        Ok(())
     }
 
     /// Whether the node still lacks a country for `source`: false once a lookup
@@ -1645,10 +1671,10 @@ impl Db {
     /// the seven-day window integrated to 53.69 GB against the 27.52 GB the
     /// minutes hold, while averaging gives 28.02 GB, matching the accumulator.
     ///
-    /// `swap_used`, `tcp`, `udp` and `procs` are stored but not returned, as
-    /// nothing draws them from history. The columns are retained deliberately,
-    /// in the hourly tier as well; `load1` was the fifth and has been removed,
-    /// see `migrate_to_2`.
+    /// `swap_used`, `tcp`, `udp` and `procs` are returned although the official
+    /// themes draw none of them from history: a theme the hub does not ship may.
+    /// The counts are rounded, as in `fold_next`; a truncated mean would show
+    /// a socket held half the bucket as none.
     ///
     /// The stamp is the bucket's start rather than a row inside it, so every
     /// series lands on one grid and the probe rows below can be shared.
@@ -1694,6 +1720,8 @@ impl Db {
                 "net_rx": r.get::<_, i64>(4)?, "net_tx": r.get::<_, i64>(5)?,
                 "net_rx_max": r.get::<_, i64>(6)?, "net_tx_max": r.get::<_, i64>(7)?,
                 "cpu_max": r.get::<_, f64>(8)?, "minutes": r.get::<_, i64>(9)?,
+                "swap_used": r.get::<_, i64>(10)?, "tcp": r.get::<_, i64>(11)?,
+                "udp": r.get::<_, i64>(12)?, "procs": r.get::<_, i64>(13)?,
             }))
         };
         if !span.hourly {
@@ -1702,7 +1730,9 @@ impl Db {
                         CAST(AVG(disk_used) AS INTEGER),
                         CAST(AVG(net_rx) AS INTEGER), CAST(AVG(net_tx) AS INTEGER),
                         MAX(MAX(net_rx, net_rx_max)), MAX(MAX(net_tx, net_tx_max)),
-                        MAX(MAX(cpu, cpu_max)), COUNT(*)
+                        MAX(MAX(cpu, cpu_max)), COUNT(*), CAST(AVG(swap_used) AS INTEGER),
+                        CAST(ROUND(AVG(tcp)) AS INTEGER), CAST(ROUND(AVG(udp)) AS INTEGER),
+                        CAST(ROUND(AVG(procs)) AS INTEGER)
                  FROM metric WHERE node_id=?1 AND ts>=?2 GROUP BY ts/?3 ORDER BY ts/?3",
             )?;
             let rows = stmt.query_map(params![node_id, span.since, span.step], row)?;
@@ -1711,13 +1741,18 @@ impl Db {
         let rolled = rolled(&conn)?.unwrap_or(i64::MIN);
         let mut stmt = conn.prepare_cached(
             "SELECT (MIN(ts)/?3)*?3, SUM(cpu*w)/SUM(w), SUM(mem_used*w)/SUM(w), SUM(disk_used*w)/SUM(w),
-                    SUM(net_rx*w)/SUM(w), SUM(net_tx*w)/SUM(w), MAX(rx_max), MAX(tx_max), MAX(cpu_top), SUM(w)
+                    SUM(net_rx*w)/SUM(w), SUM(net_tx*w)/SUM(w), MAX(rx_max), MAX(tx_max), MAX(cpu_top), SUM(w),
+                    SUM(swap_used*w)/SUM(w), CAST(ROUND(SUM(tcp*w)*1.0/SUM(w)) AS INTEGER),
+                    CAST(ROUND(SUM(udp*w)*1.0/SUM(w)) AS INTEGER),
+                    CAST(ROUND(SUM(procs*w)*1.0/SUM(w)) AS INTEGER)
              FROM (SELECT ts, minutes AS w, cpu, mem_used, disk_used, net_rx, net_tx,
-                          net_rx_max AS rx_max, net_tx_max AS tx_max, cpu_max AS cpu_top
+                          net_rx_max AS rx_max, net_tx_max AS tx_max, cpu_max AS cpu_top,
+                          swap_used, tcp, udp, procs
                    FROM metric_hour WHERE node_id=?1 AND ts>=?2 AND ts<?4
                    UNION ALL
                    SELECT ts, 1, cpu, mem_used, disk_used, net_rx, net_tx,
-                          MAX(net_rx, net_rx_max), MAX(net_tx, net_tx_max), MAX(cpu, cpu_max)
+                          MAX(net_rx, net_rx_max), MAX(net_tx, net_tx_max), MAX(cpu, cpu_max),
+                          swap_used, tcp, udp, procs
                    FROM metric WHERE node_id=?1
                         AND ts>=MAX(?2, ?4, (SELECT MAX(ts) FROM metric WHERE node_id=?1) - ?5))
              GROUP BY ts/?3 ORDER BY ts/?3",
@@ -2654,6 +2689,7 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         disk_total: n("disk_total"),
         agent_version: s("agent_version"),
         ip: s("ip"),
+        ip_other: s("ip_other"),
         ipv4: s("ipv4"),
         ipv6: s("ipv6"),
         country: s("country"),
@@ -3513,6 +3549,32 @@ mod tests {
         let stored = db.node(id).unwrap().unwrap();
         assert_eq!(stored.os.chars().count(), 128);
         assert_eq!(stored.hostname, "xy", "control characters break the panel's rows");
+
+        db.save_facts(id, &serde_json::json!({"os": "<img src=x onerror=\"a()\">'Debian'"}), "ip", "")
+            .unwrap();
+        assert_eq!(
+            db.node(id).unwrap().unwrap().os,
+            "img src=x onerror=a()Debian",
+            "no markup reaches a theme"
+        );
+    }
+
+    /// The address seen in the other family arrives on its own connection, in no
+    /// fixed order against the hello, and must not be wiped by it.
+    #[test]
+    fn the_address_seen_in_the_other_family_survives_a_hello() {
+        let db = db();
+        let id = node(&db, 1);
+        db.set_ip_other(id, "2001:db8:1::9").unwrap();
+        db.save_facts(
+            id,
+            &serde_json::json!({"ipv4": "10.0.0.5", "ipv6": "fd00::5"}),
+            "203.0.113.9",
+            "203.0.113.9",
+        )
+        .unwrap();
+        let stored = db.node(id).unwrap().unwrap();
+        assert_eq!((stored.ip.as_str(), stored.ip_other.as_str()), ("203.0.113.9", "2001:db8:1::9"));
     }
 
     /// A correction must survive the node's return. `all_traffic` gates the month
@@ -3676,8 +3738,8 @@ mod tests {
         // Six hours whose values vary within each hour, with minutes missing so
         // the hours carry different weights, and a probe that loses rounds.
         let start = 472_224 * 3_600;
-        // Per hour, the columns the chart does not return, to check the tier
-        // keeps them.
+        // Per hour, the columns the official themes do not draw, to check the
+        // tier keeps them.
         let mut kept: [Vec<[i64; 4]>; 6] = Default::default();
         for m in (0..6 * 60).filter(|m| m % 17 != 3 && !(100..130).contains(m)) {
             let ts = start + m * 60;
@@ -3709,7 +3771,7 @@ mod tests {
                 );
                 assert!((g["cpu"].as_f64().unwrap() - w["cpu"].as_f64().unwrap()).abs() < 1e-9, "{g} {w}");
                 let slack = if step == 3_600 { 0 } else { 1 };
-                for key in ["mem_used", "disk_used", "net_rx", "net_tx"] {
+                for key in ["mem_used", "disk_used", "net_rx", "net_tx", "swap_used", "tcp", "udp", "procs"] {
                     let d = g[key].as_i64().unwrap() - w[key].as_i64().unwrap();
                     assert!(d.abs() <= slack, "{key} at {step}s: {g} {w}");
                 }
@@ -3753,7 +3815,7 @@ mod tests {
         let held: usize = kept.iter().map(Vec::len).sum();
         assert_eq!(points.iter().map(|p| p["minutes"].as_i64().unwrap()).sum::<i64>(), held as i64);
         assert_eq!(points.iter().map(|p| p["cpu_max"].as_f64().unwrap()).fold(0.0, f64::max), 9.0 + 10.0);
-        // The columns the chart does not return are kept as each hour's mean,
+        // The columns the official themes do not draw are kept as each hour's mean,
         // swap truncated like the other bytes and the counts rounded.
         let stored: Vec<[i64; 4]> = db
             .conn()

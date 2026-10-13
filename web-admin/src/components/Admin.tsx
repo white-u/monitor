@@ -507,6 +507,39 @@ function Field({ label, hint, help, helpWidth, className = "", children }: {
   )
 }
 
+// A switch with its label, in the same two registers as `Field`: what it does
+// in one line underneath, and why or at what risk behind the question mark. Not
+// a <label>: a tap on the words must not flip the switch, only the switch is
+// pressable. aria-labelledby keeps the association for screen readers.
+function SwitchRow({ label, hint, extra, help, helpWidth, checked, onChange }: {
+  label: string
+  hint?: string
+  extra?: React.ReactNode
+  help?: React.ReactNode
+  helpWidth?: string
+  checked: boolean
+  onChange: (on: boolean) => void
+}) {
+  const id = useId()
+  return (
+    <div className="flex items-start gap-2">
+      <Switch aria-labelledby={id} checked={checked} onCheckedChange={onChange} className="mt-0.5" />
+      <div className="space-y-1">
+        <div className="text-sm leading-snug text-balance">
+          <span id={id}>{label}</span>
+          {help && (
+            <span className="ml-1.5 inline-flex align-middle">
+              <Help width={helpWidth}>{help}</Help>
+            </span>
+          )}
+        </div>
+        {hint && <p className="text-xs leading-relaxed text-muted-foreground break-keep wrap-anywhere">{hint}</p>}
+        {extra}
+      </div>
+    </div>
+  )
+}
+
 // A tap shows no tooltip on its own, so a click opens it as well. The trigger's
 // own handlers would close it on press and on click; both are prevented.
 //
@@ -2656,7 +2689,7 @@ function useSettings() {
         const fresh = await api<Settings>("/settings")
         setS((old) => {
           const next = { ...old }
-          for (const key of Object.keys(patch)) next[key] = fresh[key]
+          for (const key of [...Object.keys(patch), "your_address"]) next[key] = fresh[key]
           for (const [key, value] of Object.entries(fresh)) if (key.endsWith("_set")) next[key] = value
           return next
         })
@@ -2727,6 +2760,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
   const { s, set, save } = useSettings()
   const iconPicker = useRef<HTMLInputElement>(null)
   if (!s) return null
+  const cdnOnly = s.origin_cdn_only === "on"
   // Applied on its own, as soon as a file is picked: a picked file is already a
   // decision, and the form's save button below is easy to miss for it.
   const saveIcons = (icons: { favicon: string; touch_icon: string }, done: string) =>
@@ -2807,13 +2841,9 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
           </Field>
           <Field
             label="GitHub 代理"
-            helpWidth="max-w-58 min-[376px]:max-w-86 min-[432px]:max-w-100"
-            help={
-              <>
-                <p>留空直连。仅在 hub 自己拉不到 GitHub Release 时填。</p>
-                <p>这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像。</p>
-              </>
-            }
+            hint="留空直连，只在 hub 拉不到 GitHub Release 时填"
+            helpWidth="max-w-58 min-[376px]:max-w-86"
+            help={<p>这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像。</p>}
           >
             <Input
               value={String(s.github_proxy ?? "")}
@@ -2822,15 +2852,39 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
             />
           </Field>
         </div>
-        {/* 不是 <label>：点文字不该切换开关，只有开关自己可点。
-            aria-labelledby 保住读屏软件那边的关联。 */}
-        <div className="flex items-center gap-2 text-sm">
-          <Switch
-            aria-labelledby="public-page-label"
+        <div className="space-y-4">
+          <SwitchRow
+            label="开放公开状态页"
+            hint="关闭后所有页面需登录"
             checked={s.public_page !== "off"}
-            onCheckedChange={(v) => set("public_page", v ? "on" : "off")}
+            onChange={(v) => set("public_page", v ? "on" : "off")}
           />
-          <span id="public-page-label">开放公开状态页，关闭后所有页面需登录</span>
+          <SwitchRow
+            label="我确认源站只对 Cloudflare 或隧道开放"
+            hint="登录通知和限流取访客的真实地址"
+            extra={
+              <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                <span>保存后核对，当前认出你的地址</span>
+                <code className="rounded-md border bg-muted/50 px-1.5 py-0.5 font-mono text-foreground select-all">
+                  {String(s.your_address ?? "未知")}
+                </code>
+              </p>
+            }
+            helpWidth="max-w-62 min-[392px]:max-w-90 min-[440px]:max-w-104"
+            help={
+              <>
+                <p>打开前先确认源站只有 Cloudflare 连得上：用隧道，源站不开公网端口；或让 Cloudflare 回源带一个密钥头，反代没带就拒绝。</p>
+                <p>只放行 Cloudflare 的回源地址不够，别人的 Worker 也从那些地址连过来。</p>
+                <p>
+                  不是却打开，别人直连源站自己写 <span className="whitespace-nowrap">CF-Connecting-IP</span> 或{" "}
+                  <span className="whitespace-nowrap">X-Forwarded-For</span>，就能每次换一个地址猜密码，限流形同虚设。
+                </p>
+                <p>别家 CDN 用不上这个开关，在反代上配 realip。</p>
+              </>
+            }
+            checked={cdnOnly}
+            onChange={(v) => set("origin_cdn_only", v ? "on" : "off")}
+          />
         </div>
         <div>
           <Button
@@ -2842,6 +2896,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                 // being the one value this key's write path refuses.
                 retention_days: String(s.retention_days || "30"),
                 github_proxy: String(s.github_proxy ?? ""),
+                origin_cdn_only: s.origin_cdn_only === "on" ? "on" : "off",
                 public_page: s.public_page === "off" ? "off" : "on",
               }).then((ok) => ok && onSaved())
             }
