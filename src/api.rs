@@ -905,6 +905,22 @@ fn group_error(group: &mut String) -> Option<&'static str> {
     None
 }
 
+/// Node and probe names, as a panel row, a theme card and a chart legend show
+/// them. Refused rather than truncated, as a group name is.
+const MAX_NAME: usize = 64;
+
+/// Trims a node name, or refuses it.
+fn name_error(name: &mut String) -> Option<&'static str> {
+    *name = name.trim().to_owned();
+    if name.is_empty() {
+        return Some("请填写节点名称");
+    }
+    if name.chars().count() > MAX_NAME {
+        return Some("节点名称最多 64 个字");
+    }
+    None
+}
+
 /// A public remark goes to every visitor in every frame, every two seconds, where
 /// a node's public view is about 1 KB; a hundred CJK characters add 300 bytes.
 const MAX_PUBLIC_REMARK: usize = 100;
@@ -934,11 +950,8 @@ fn billing_error(currency: Option<&mut String>, cycle: Option<&mut String>) -> O
 /// check both the single and the batch write pass through, so the two accept
 /// exactly the same values.
 fn patch_error(node: &mut NodePatch) -> Option<&'static str> {
-    if let Some(name) = &mut node.name {
-        *name = name.trim().to_owned();
-        if name.is_empty() {
-            return Some("请填写节点名称");
-        }
+    if let Some(message) = node.name.as_mut().and_then(name_error) {
+        return Some(message);
     }
     if let Some(group) = &mut node.group {
         if let Some(message) = group_error(group) {
@@ -1018,17 +1031,13 @@ pub async fn create_node(
         return answer(StatusCode::FORBIDDEN, refusal);
     }
     let Ok(Json(mut node)) = body else { return bad("节点数据格式不对") };
-    if node.name.trim().is_empty() {
-        return bad("请填写节点名称");
-    }
-    if let Some(message) =
-        node_limits(Some(node.traffic_reset_day), Some(node.price), Some(node.traffic_limit))
-            .or_else(|| group_error(&mut node.group))
-            .or_else(|| billing_error(Some(&mut node.currency), Some(&mut node.billing_cycle)))
+    if let Some(message) = name_error(&mut node.name)
+        .or_else(|| node_limits(Some(node.traffic_reset_day), Some(node.price), Some(node.traffic_limit)))
+        .or_else(|| group_error(&mut node.group))
+        .or_else(|| billing_error(Some(&mut node.currency), Some(&mut node.billing_cycle)))
     {
         return bad(message);
     }
-    node.name = node.name.trim().to_owned();
     let token = random_token();
     match app.db.create_node(&node, &token) {
         // Usable immediately: the install dialog reads the token as it opens, so
@@ -1144,9 +1153,9 @@ pub async fn agent_register(
 
     // The name comes from a machine not yet vouched for, and is shown to every
     // visitor until the operator renames the node. Trimmed last: a name made of
-    // markup characters and spaces must come out empty, not as a blank.
-    let name = db::reported_text(&name, 64).trim().to_owned();
-    let name = if name.is_empty() { "unnamed".to_owned() } else { name };
+    // markup characters and spaces must come out empty, not as a blank, and
+    // `create_node` names an empty one after the node's id.
+    let name = db::reported_text(&name, MAX_NAME).trim().to_owned();
     // Field defaults live in `Node`'s serde attributes and nowhere else.
     // `Node::default()` is a different set of values -- private, reset day 0 --
     // and a node registered here must match one added through the panel.
@@ -1300,14 +1309,11 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
         Err(e) => return fail(e),
     }
     // The token is checked only at the handshake, so deleting the row does not
-    // end a connection already open on it; dropping the sender does. Without
-    // this the agent would keep reporting under an id SQLite reassigns to the
-    // next node created, which would then appear online on another node's
-    // metrics. Dropped after the delete, so the reconnect that follows finds no
-    // token to accept. The same reasoning applies in `reset_token` below.
+    // end a connection already open on it; dropping the sender does. Dropped
+    // after the delete, so the reconnect that follows finds no token to accept.
+    // The same reasoning applies in `reset_token` below.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    // Its held reading as well, which would otherwise be booked into the node
-    // that inherits the id.
+    // Its held reading as well, which no node would book.
     app.readings.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     invalidate_snapshot(&app);
     Json(json!({"ok": true})).into_response()
@@ -1419,6 +1425,9 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
     task.target = task.target.trim().to_owned();
     if task.name.is_empty() || task.target.is_empty() {
         return bad("请填写名称和目标");
+    }
+    if task.name.chars().count() > MAX_NAME {
+        return bad("名称最多 64 个字");
     }
     // A TCP probe requires an explicit port; a bare host would silently never
     // connect.
@@ -2609,6 +2618,16 @@ mod tests {
         for refused in [0, -1, 4, 3_601, i64::MAX] {
             assert_eq!(save(refused).await.status(), StatusCode::BAD_REQUEST, "{refused}");
         }
+        let long = PingTask {
+            name: "名".repeat(MAX_NAME + 1),
+            target: "1.1.1.1:443".into(),
+            interval: 60,
+            ..Default::default()
+        };
+        assert_eq!(
+            save_ping_task(Admin, State(app.clone()), Json(long)).await.status(),
+            StatusCode::BAD_REQUEST
+        );
         assert!(app.db.ping_tasks().unwrap().is_empty(), "a refused interval must not store a probe");
 
         // Both ends of the range still save, storing exactly what was sent.
@@ -3303,10 +3322,7 @@ mod tests {
     }
 
     /// Deleting a node must reach the connection it opened, for the same reason
-    /// rotating its token does, and more urgently: SQLite reassigns the freed id
-    /// to the next node created. Left connected, the old machine reports under
-    /// that id, so an undeployed node appears online with another machine's
-    /// metrics, and its traffic and history are booked to it.
+    /// rotating its token does, and a node created afterwards inherits nothing.
     #[tokio::test]
     async fn deleting_a_node_closes_its_session_so_the_next_id_does_not_inherit_it() {
         let app = std::sync::Arc::new(app());
@@ -3322,9 +3338,8 @@ mod tests {
             "the deleted node's agent must be told to go"
         );
 
-        // SQLite reuses the id; nothing of the old machine may accompany it.
         let fresh = node(&app, "fresh", true);
-        assert_eq!(fresh, old, "the fixture only means anything if the id is reused");
+        assert_ne!(fresh, old, "a deleted node's id is not issued again");
         let nodes = visible_nodes(&app, true).unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0]["online"], json!(false), "a node nobody deployed is not online");
@@ -3412,6 +3427,7 @@ mod tests {
             json!({"name": "x", "billing_cycle": "0m"}),
             json!({"name": "x", "billing_cycle": "1201m"}),
             json!({"name": "x", "billing_cycle": "weekly"}),
+            json!({"name": "名".repeat(MAX_NAME + 1)}),
         ] {
             let created = create_node(
                 Admin,
@@ -3700,13 +3716,16 @@ mod tests {
     }
 
     /// The name comes from an unvouched machine: markup characters are dropped,
-    /// and what that leaves is trimmed, so a name made only of them is `unnamed`.
+    /// and what that leaves is trimmed. None at all, the machine's hostname
+    /// withheld by `install.sh`, names the node after its id.
     #[tokio::test]
     async fn a_registered_name_loses_markup_and_is_never_blank() {
         let app = std::sync::Arc::new(app());
         open_register(Admin, State(app.clone()), panel_headers()).await;
         let key = app.db.get("register_key").unwrap();
-        for (sent, stored) in [("< >", "unnamed"), ("<b>web</b>", "bweb/b"), ("Tom's \"VPS\"", "Toms VPS")] {
+        for (sent, stored) in
+            [("", "节点 1"), ("< >", "节点 2"), ("<b>web</b>", "bweb/b"), ("Tom's \"VPS\"", "Toms VPS")]
+        {
             let mut headers = HeaderMap::new();
             headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
             let reply = agent_register(
@@ -3751,8 +3770,8 @@ mod tests {
     fn a_node_view_carries_traffic_even_while_offline() {
         let app = app();
         let id = node(&app, "n", true);
-        app.db.accumulate(id, "b", (100, 100), Local::now()).unwrap();
-        app.db.accumulate(id, "b", (900, 500), Local::now()).unwrap();
+        app.db.accumulate(id, "b", (100, 100), Local::now(), None).unwrap();
+        app.db.accumulate(id, "b", (900, 500), Local::now(), None).unwrap();
         app.db.touch_seen(id, 1_700_000_000, &serde_json::Value::Null).unwrap();
 
         let view = &visible_nodes(&app, true).unwrap()[0];
