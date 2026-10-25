@@ -209,17 +209,16 @@ fn node_view(
     full: bool,
     now: DateTime<Local>,
 ) -> Value {
-    // The three capacities arrive twice: once in `Facts`, sent at the handshake,
-    // and again in every `Metrics`. The stored figure follows the reports a
-    // minute at a time and as the session ends, so it lags a disk mounted while
-    // the agent runs -- the agent re-reads its mount table every sample so that
-    // it appears -- by up to a minute. Using the report while a node is connected
-    // keeps every consumer of this view on one number: the card reads the live
-    // metrics and the detail page reads these, which would otherwise show the
-    // same machine two different capacities. Offline, the stored figure is the
-    // last one reported. No floor is applied: a host whose swap has just been
-    // disabled reports zero and means it. A node connected but not yet reporting
-    // holds `Null`, where `get` returns nothing and the stored figure stands.
+    // The three capacities arrive in every `Metrics`. The stored figure follows the
+    // reports a minute at a time and as the session ends, so it lags a disk mounted
+    // while the agent runs -- the agent re-reads its mount table every sample so
+    // that it appears -- by up to a minute. Using the report while a node is
+    // connected keeps every consumer of this view on one number: the card reads the
+    // live metrics and the detail page reads these, which would otherwise show the
+    // same machine two different capacities. Offline, the stored figure is the last
+    // one reported. No floor is applied: a host whose swap has just been disabled
+    // reports zero and means it. A node connected but not yet reporting holds
+    // `Null`, where `get` returns nothing and the stored figure stands.
     let live = |key: &str, stored: i64| {
         current.and_then(|a| a.metrics.get(key).and_then(serde_json::Value::as_i64)).unwrap_or(stored)
     };
@@ -724,6 +723,21 @@ fn stream_slot(session: Option<&str>) -> Result<Option<tokio::sync::SemaphorePer
     PUBLIC_STREAM_GATE.try_acquire().map(Some).map_err(|_| ())
 }
 
+/// Whom a stream handshake speaks for: `Some(Some(digest))` for a session,
+/// `Some(None)` for a visitor, `None` for one the closed status page turns away.
+///
+/// The digest rather than the result: signing out must reach a stream already
+/// running, and only the row it names can report whether it has.
+/// A sibling subdomain's script opens this with the cookie too, and a WebSocket
+/// is not held back by CORS: it would read the admin frame. Such a handshake is
+/// answered as an anonymous one.
+fn stream_viewer(app: &App, headers: &HeaderMap) -> Option<Option<String>> {
+    let session = current_session(headers)
+        .filter(|_| !from_other_origin(headers))
+        .filter(|hash| app.db.session_valid(hash));
+    (session.is_some() || app.public_page()).then_some(session)
+}
+
 /// Live stream for the browser. Each connection runs its own timer -- simpler to
 /// reason about than a fan-out channel -- over a shared snapshot, so a timer
 /// costs no more than a send.
@@ -733,17 +747,9 @@ pub async fn live_ws(
     Query(stream): Query<Stream>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    // The digest rather than the result: signing out must reach a stream already
-    // running, and only the row it names can report whether it has.
-    // A sibling subdomain's script opens this with the cookie too, and a
-    // WebSocket is not held back by CORS: it would read the admin frame. Such a
-    // handshake is answered as an anonymous one.
-    let session = current_session(&headers)
-        .filter(|_| !from_other_origin(&headers))
-        .filter(|hash| app.db.session_valid(hash));
-    if session.is_none() && !app.public_page() {
+    let Some(session) = stream_viewer(&app, &headers) else {
         return answer(StatusCode::UNAUTHORIZED, "需要登录后查看");
-    }
+    };
     let Ok(slot) = stream_slot(session.as_deref()) else {
         return answer(StatusCode::SERVICE_UNAVAILABLE, "同时在线的访客太多，请稍后再试");
     };
@@ -1624,7 +1630,7 @@ async fn append(
 
 /// A scratch file beside the database, so the copy lands on the same filesystem
 /// the database has room on. The random component keeps two concurrent calls
-/// apart, since `VACUUM INTO` refuses an existing file.
+/// apart, since `VACUUM INTO` refuses a file that is not empty.
 fn scratch_path(app: &App, kind: &str) -> String {
     format!("{}.{kind}-{}.tmp", app.db.file(), &random_token()[..16])
 }
@@ -1897,7 +1903,8 @@ pub async fn versions(_: Admin, State(app): State<Shared>) -> Json<Value> {
 fn fresh_enough(cached: &crate::Releases, now: i64) -> bool {
     let holds =
         if cached.hub.is_empty() || cached.agent.is_empty() { RELEASES_RETRY } else { RELEASES_FRESH };
-    cached.read_at != 0 && now - cached.read_at < holds
+    // A negative age is a clock set back since the lookup, not a fresh one.
+    cached.read_at != 0 && (0..holds).contains(&(now - cached.read_at))
 }
 
 /// The tag of a repository's latest release, without its leading `v`, or None
@@ -2361,7 +2368,11 @@ pub async fn save_settings(
             }
             continue;
         }
-        if let Err(e) = app.db.set(key, value) {
+        let saved = match key.as_str() {
+            "github_allowed_users" => app.db.set_github_allowed(value),
+            _ => app.db.set(key, value),
+        };
+        if let Err(e) = saved {
             return fail(e);
         }
     }
@@ -2474,6 +2485,10 @@ mod tests {
         assert!(!fresh_enough(&read(now - 7 * 3600, "1.2.0", "1.1.0"), now));
         assert!(fresh_enough(&read(now - 300, "", ""), now), "a failure is held briefly");
         assert!(!fresh_enough(&read(now - 1200, "1.2.0", ""), now), "half an answer is a failure");
+        assert!(
+            !fresh_enough(&read(now + 3600, "1.2.0", "1.1.0"), now),
+            "read before the clock was set back"
+        );
     }
 
     fn app_with_site(site: &str) -> App {
@@ -2544,6 +2559,8 @@ mod tests {
             "https://198.51.100.1",
             "https://user@monitor.example.com",
             "https://monitor.example.com/path",
+            "https://localhost",
+            "https://hub.localhost",
         ] {
             assert!(https_domain(site).is_none());
             assert_eq!(provisioning_allowed(&app_with_site(site), &good), Err(PROVISIONING_DENIED), "{site}");
@@ -2688,7 +2705,8 @@ mod tests {
     /// has landed, so a piece continues it, restarts it, or is refused.
     #[tokio::test]
     async fn a_chunk_continues_an_upload_only_where_the_last_one_ended() {
-        let path = std::env::temp_dir().join(format!("monitor-chunk-{}", std::process::id()));
+        let tmp = crate::TempDir::new("chunk");
+        let path = tmp.0.join("upload");
         let path = path.to_str().unwrap();
         let piece = |offset, total| Chunk { offset, total };
         let body = |bytes: &'static [u8]| axum::body::Body::from(bytes);
@@ -2713,7 +2731,6 @@ mod tests {
         // Starting over truncates whatever an interrupted attempt left behind.
         assert_eq!(receive(path, &piece(0, 2), 1024, body(b"hi")).await.unwrap(), 2);
         assert_eq!(std::fs::read(path).unwrap(), b"hi");
-        std::fs::remove_file(path).unwrap();
     }
 
     /// Both scratch names a restore uses sit beside the live database, and one left
@@ -2726,29 +2743,44 @@ mod tests {
     /// could silently drop.
     #[tokio::test]
     async fn a_finished_restore_leaves_no_scratch_file_behind() {
-        let dir = std::env::temp_dir().join(format!("monitor-restore-{}", &random_token()[..16]));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = crate::TempDir::new("restore");
+        let dir = tmp.0.clone();
         let live = dir.join("live.db").to_string_lossy().into_owned();
         let app = std::sync::Arc::new(App::for_test(Db::open(&live).unwrap()));
         node(&app, "kept", true);
         app.db.set("origin_cdn_only", "on").unwrap();
+        // In the backup, and so restored with it unless the restore drops it.
+        app.db.create_session(&sha256("backed-up"), Utc::now().timestamp() + 3_600).unwrap();
 
         // What a restore actually receives: a backup of a hub database.
         let copy = format!("{live}.copy");
         app.db.backup_into(&copy).unwrap();
         let bytes = std::fs::read(&copy).unwrap();
         std::fs::remove_file(&copy).unwrap();
+        // Not in the backup: it stays until the last chunk has arrived.
+        node(&app, "added", true);
 
-        let done = db_restore(
-            Admin,
-            State(app.clone()),
-            Query(Chunk { offset: 0, total: bytes.len() as u64 }),
-            HeaderMap::new(),
-            axum::body::Body::from(bytes),
-        )
-        .await;
-        assert_eq!(done.status(), StatusCode::OK);
+        // In two chunks, as the panel sends any backup larger than one.
+        let (total, half) = (bytes.len() as u64, bytes.len() / 2);
+        let mut done = None;
+        for (offset, piece) in [(0, &bytes[..half]), (half as u64, &bytes[half..])] {
+            let piece = axum::body::Body::from(piece.to_vec());
+            done = Some(
+                db_restore(
+                    Admin,
+                    State(app.clone()),
+                    Query(Chunk { offset, total }),
+                    HeaderMap::new(),
+                    piece,
+                )
+                .await,
+            );
+            let expected = if offset == 0 { 2 } else { 1 };
+            assert_eq!(app.db.nodes().unwrap().len(), expected, "restored on the last chunk alone");
+        }
+        assert_eq!(done.unwrap().status(), StatusCode::OK);
         assert_eq!(app.db.nodes().unwrap().len(), 1, "the backup went in");
+        assert!(!app.db.session_valid(&sha256("backed-up")), "a session from the backup does not come back");
         assert_eq!(
             app.db.get("origin_cdn_only").as_deref(),
             Some("off"),
@@ -2762,7 +2794,6 @@ mod tests {
             .filter(|name| !matches!(name.as_str(), "live.db" | "live.db-wal" | "live.db-shm"))
             .collect();
         assert!(left.is_empty(), "left beside the database: {left:?}");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A connected agent holding one report. The receiver is returned because
@@ -2972,6 +3003,25 @@ mod tests {
             app.db.insert_pings(even, &[(even_probe, wide_base + i as i64, latency)]).unwrap();
         }
         assert_eq!(app.db.ping_records(even, Span::minutes(wide_base, 180)).unwrap().0[0]["latency"], 25);
+        // An odd count is its middle reading, with the ranks around it far apart.
+        let odd = node(&app, "odd", true);
+        let odd_probe = task(&app, vec![odd]);
+        for (i, latency) in [20, 900, 30].into_iter().enumerate() {
+            app.db.insert_pings(odd, &[(odd_probe, wide_base + i as i64, latency)]).unwrap();
+        }
+        assert_eq!(app.db.ping_records(odd, Span::minutes(wide_base, 180)).unwrap().0[0]["latency"], 30);
+
+        // Several buckets: each row is stamped with its own bucket's start.
+        let grid = node(&app, "grid", true);
+        let grid_probe = task(&app, vec![grid]);
+        // Three whole buckets in the past, whatever second the suite runs at.
+        let since = wide_base - 3 * 180;
+        for i in 0..3 {
+            app.db.insert_pings(grid, &[(grid_probe, since + i * 180 + 7, 20)]).unwrap();
+        }
+        let rows = app.db.ping_records(grid, Span::minutes(since, 180)).unwrap().0;
+        let stamps: Vec<_> = rows.iter().map(|r| r["ts"].clone()).collect();
+        assert_eq!(stamps, [since, since + 180, since + 360].map(|t| json!(t)));
     }
 
     /// What a window lost is the proportion of its samples lost, and only the hub
@@ -3501,6 +3551,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_closed_status_page_and_a_sibling_origin_see_no_admin_data() {
+        let app = std::sync::Arc::new(app());
+        app.db.create_session(&sha256("live-token"), Utc::now().timestamp() + 3_600).unwrap();
+        let signed_in = |site: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::COOKIE, format!("{}=live-token", crate::auth::COOKIE).parse().unwrap());
+            headers.insert("sec-fetch-site", site.parse().unwrap());
+            headers
+        };
+        let operator = Some(Some(sha256("live-token")));
+        assert_eq!(stream_viewer(&app, &signed_in("same-origin")), operator);
+        assert_eq!(
+            stream_viewer(&app, &signed_in("same-site")),
+            Some(None),
+            "a sibling's script is a visitor"
+        );
+        assert_eq!(stream_viewer(&app, &HeaderMap::new()), Some(None));
+
+        app.db.set("public_page", "off").unwrap();
+        assert_eq!(stream_viewer(&app, &signed_in("same-origin")), operator);
+        assert_eq!(stream_viewer(&app, &signed_in("same-site")), None);
+        assert_eq!(stream_viewer(&app, &HeaderMap::new()), None);
+        assert_eq!(nodes(State(app.clone()), HeaderMap::new()).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(nodes(State(app), signed_in("same-origin")).await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn only_the_admin_node_list_is_marked_no_transform() {
         let app = std::sync::Arc::new(app());
         app.db.create_session(&sha256("live-token"), Utc::now().timestamp() + 3_600).unwrap();
@@ -3789,22 +3866,20 @@ mod tests {
         assert_eq!(visible_nodes(&app, true).unwrap()[1]["last_seen_ago"], Value::Null, "never seen");
     }
 
-    /// A capacity arrives twice -- once in the facts stored at the handshake, and
-    /// again in every report -- and the two diverge as soon as a disk is mounted
-    /// on a running machine, which the agent detects by re-reading its mount table
-    /// every sample. Drawn from the stored copy, the card and the detail page
-    /// would show the same host two different sizes until it reconnected.
+    /// The stored capacities trail the reports by up to a minute, and a disk is
+    /// mounted on a running machine at any moment, which the agent detects by
+    /// re-reading its mount table every sample. Drawn from the stored copy, the
+    /// card and the detail page would show the same host two different sizes.
     #[test]
-    fn a_capacity_that_changed_since_the_handshake_is_the_reported_one() {
+    fn a_capacity_that_changed_since_the_last_write_is_the_reported_one() {
         let app = app();
         let id = node(&app, "n", true);
-        // What the handshake stored: 30 GB of disk, 1 GB of swap.
+        // What the last write stored: 30 GB of disk, 1 GB of swap.
         app.db
-            .save_facts(
+            .touch_seen(
                 id,
+                1,
                 &json!({"mem_total": 1_000, "swap_total": 1i64 << 30, "disk_total": 30i64 << 30}),
-                "ip",
-                "",
             )
             .unwrap();
 
@@ -3815,8 +3890,7 @@ mod tests {
             "with nobody connected the stored facts are all there is"
         );
 
-        // A 5 GB volume is mounted and swap is disabled. The same session, with no
-        // second hello, so the stored facts do not change.
+        // A 5 GB volume is mounted and swap is disabled, before the next write.
         let _held = connect(
             &app,
             id,

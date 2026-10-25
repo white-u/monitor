@@ -159,14 +159,17 @@ pub fn read(conn: &Connection, node: i64, days: i64, retention: i64, now: DateTi
          WHERE node_id=?1 AND day>=?2 AND day<=?3 ORDER BY day,slot",
     )?;
     let records = statement.query_map(params![node, since, today.to_string()], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
     })?;
     let mut recorded = false;
     for record in records {
         let (day, slot, rx, tx) = record?;
         let index = (today - day.parse::<NaiveDate>()?).num_days() as usize;
-        anyhow::ensure!(index < rows.len() && slot < 4 && rx >= 0 && tx >= 0, "invalid traffic period");
-        rows[index].periods[slot] = Some(Bytes::new(rx as u128, tx as u128));
+        anyhow::ensure!(
+            index < rows.len() && (0..4).contains(&slot) && rx >= 0 && tx >= 0,
+            "invalid traffic period"
+        );
+        rows[index].periods[slot as usize] = Some(Bytes::new(rx as u128, tx as u128));
         totals[index].0 += rx as u128;
         totals[index].1 += tx as u128;
         summary.0 += rx as u128;

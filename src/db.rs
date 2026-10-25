@@ -730,9 +730,7 @@ fn restrict(path: &str) {
     }
 }
 
-/// One file, owner-only. Also applied to the backup copy `VACUUM INTO` writes,
-/// which is the entire credential store in one portable file, created under the
-/// umask like any other.
+/// One file, owner-only.
 fn own_only(file: &str) {
     #[cfg(unix)]
     {
@@ -1064,14 +1062,50 @@ impl Db {
     /// As [`Db::get`], with a failed read kept apart from an absent key, for a
     /// caller that would otherwise act on "nothing saved".
     pub fn lookup(&self, key: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn()
-            .query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| r.get(0))
-            .optional()?)
+        setting(&self.conn(), key)
     }
 
     pub fn set(&self, key: &str, value: &str) -> Result<()> {
         put_setting(&self.conn(), key, value)
+    }
+
+    /// Stores the GitHub allow list and drops the bindings of the logins it no
+    /// longer names, both or neither: a removal stored without its prune would
+    /// leave the old account bound when the name is added back.
+    pub fn set_github_allowed(&self, list: &str) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let ids = setting(&tx, crate::auth::GITHUB_IDS)?.unwrap_or_default();
+        put_setting(&tx, "github_allowed_users", list)?;
+        put_setting(&tx, crate::auth::GITHUB_IDS, &crate::auth::keep_listed(&ids, list))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The GitHub account id `login` is bound to, binding it to `id` when it has
+    /// none; `None` when the allow list no longer names it. The list is read
+    /// again under the writer lock: a save that removed the name during the
+    /// OAuth exchange would otherwise be followed by a binding the removal was
+    /// meant to clear.
+    pub fn bind_github(&self, login: &str, id: &str) -> Result<Option<String>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let list = setting(&tx, "github_allowed_users")?.unwrap_or_default();
+        if !crate::auth::allowed_logins(&list).iter().any(|l| l == login) {
+            return Ok(None);
+        }
+        let ids = setting(&tx, crate::auth::GITHUB_IDS)?.unwrap_or_default();
+        if let Some(bound) = crate::auth::bound_id(&ids, login) {
+            return Ok(Some(bound.to_owned()));
+        }
+        let pair = format!("{login}:{id}");
+        put_setting(
+            &tx,
+            crate::auth::GITHUB_IDS,
+            &if ids.is_empty() { pair } else { format!("{ids},{pair}") },
+        )?;
+        tx.commit()?;
+        Ok(Some(id.to_owned()))
     }
 
     // ---- nodes ----
@@ -1279,10 +1313,12 @@ impl Db {
         Ok(self.conn().query_row("SELECT id FROM node WHERE token = ?1", [token], |r| r.get(0)).optional()?)
     }
 
-    /// Stores the slow-changing facts an agent sends on connect, and reports
-    /// whether the node still requires a country lookup for `source`, the address
-    /// `agent_ws::country_source` chose. An empty `source` has no country and is
-    /// never owed one.
+    /// Stores the facts an agent sends on connect and again whenever they change,
+    /// and reports whether the node still requires a country lookup for `source`,
+    /// the address `agent_ws::country_source` chose. An empty `source` has no
+    /// country and is never owed one. Capacities are not among them, even where an agent still
+    /// sends them: they change with every mount, and [`Db::touch_seen`] keeps
+    /// them from the reports.
     ///
     /// A new source invalidates the previous country, so the two move together in
     /// one statement: `SET` reads the row as it was, so the comparison is against
@@ -1300,13 +1336,12 @@ impl Db {
         let conn = self.conn();
         conn.execute(
             "UPDATE node SET hostname=?2, os=?3, kernel=?4, arch=?5, virt=?6, cpu_name=?7,
-                             cpu_cores=?8, mem_total=?9, swap_total=?10, disk_total=?11,
-                             agent_version=?12, ip=?13, ipv4=?14, ipv6=?15, country_ip=?16,
-                             country=CASE WHEN country_ip=?16 THEN country
-                                          WHEN country_prev_ip=?16 THEN country_prev ELSE '' END,
-                             country_prev_ip=CASE WHEN country_ip=?16 OR country='' THEN country_prev_ip
+                             cpu_cores=?8, agent_version=?9, ip=?10, ipv4=?11, ipv6=?12, country_ip=?13,
+                             country=CASE WHEN country_ip=?13 THEN country
+                                          WHEN country_prev_ip=?13 THEN country_prev ELSE '' END,
+                             country_prev_ip=CASE WHEN country_ip=?13 OR country='' THEN country_prev_ip
                                                   ELSE country_ip END,
-                             country_prev=CASE WHEN country_ip=?16 OR country='' THEN country_prev
+                             country_prev=CASE WHEN country_ip=?13 OR country='' THEN country_prev
                                                ELSE country END
              WHERE id=?1",
             params![
@@ -1318,9 +1353,6 @@ impl Db {
                 s("virt"),
                 s("cpu_name"),
                 n("cpu_cores"),
-                n("mem_total"),
-                n("swap_total"),
-                n("disk_total"),
                 s("agent_version"),
                 ip,
                 s("ipv4"),
@@ -2445,15 +2477,20 @@ impl Db {
     /// reads the whole file, so the caller runs it off the runtime -- every other
     /// statement here is sub-millisecond, this one is not.
     pub fn backup_into(&self, dest: &str) -> Result<()> {
+        // The copy is the credential store in one portable file: node tokens in
+        // the clear, the GitHub secret, the password hash. SQLite would create
+        // it under the umask, world-readable at the usual 022 for as long as the
+        // copy takes; it writes into an empty file that already exists instead.
+        let mut empty = std::fs::OpenOptions::new();
+        empty.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut empty, 0o600);
+        empty.open(dest)?;
         // A connection of its own. `VACUUM INTO` only reads, and WAL allows it to
         // read a consistent snapshot while the agents continue writing through
         // the first -- exporting is the one heavy operation here that need not
         // block them. Not the charts' reader, which it would hold throughout.
         read_only(&self.file())?.execute("VACUUM INTO ?1", [dest])?;
-        // The copy is the credential store in one portable file: node tokens in
-        // the clear, the GitHub secret, the password hash. SQLite creates it
-        // under the umask, which at the usual 022 is world-readable.
-        own_only(dest);
         Ok(())
     }
 
@@ -2729,6 +2766,10 @@ fn issued(conn: &Connection, table: &str) -> Result<i64> {
 /// The tables whose ids [`next_id`] issues.
 const ID_TABLES: [&str; 2] = ["node", "ping_task"];
 
+fn setting(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn.query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| r.get(0)).optional()?)
+}
+
 fn put_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO setting (key, value) VALUES (?1, ?2)
@@ -2813,6 +2854,29 @@ mod tests {
         Db::open(":memory:").unwrap()
     }
 
+    #[test]
+    fn an_allowed_login_stays_bound_to_the_account_it_first_signed_in_as() {
+        let db = db();
+        db.set_github_allowed(" Alice, ,bob,").unwrap();
+        assert_eq!(db.bind_github("alice", "1").unwrap().as_deref(), Some("1"), "first sign-in binds");
+        assert_eq!(
+            db.bind_github("alice", "2").unwrap().as_deref(),
+            Some("1"),
+            "another account under the name"
+        );
+        assert_eq!(db.bind_github("bob", "3").unwrap().as_deref(), Some("3"));
+        assert_eq!(db.bind_github("carol", "4").unwrap(), None, "a login the list does not name");
+        db.set_github_allowed("ALICE ").unwrap();
+        assert_eq!(db.get(crate::auth::GITHUB_IDS).as_deref(), Some("alice:1"), "case and spaces keep it");
+        db.set_github_allowed("bob").unwrap();
+        db.set_github_allowed("alice,bob").unwrap();
+        assert_eq!(
+            db.bind_github("alice", "2").unwrap().as_deref(),
+            Some("2"),
+            "removed and re-added binds afresh"
+        );
+    }
+
     /// One worker, as on a one-core hub: a task waiting for the writer must not
     /// keep it, or the timer below would never fire.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -2871,26 +2935,15 @@ mod tests {
         assert_eq!(read("busy_timeout"), 5_000);
     }
 
-    /// A real file, for the tests that exercise what happens to one. Removed with
-    /// its companions when dropped.
-    struct Scratch(String);
+    /// A real file, for the tests that exercise what happens to one. It sits alone
+    /// in a [`crate::TempDir`], so its journal and every file a test puts beside it
+    /// go with it.
+    struct Scratch(String, #[expect(dead_code, reason = "held for its Drop")] crate::TempDir);
 
     impl Scratch {
         fn new() -> Self {
-            Self(
-                std::env::temp_dir()
-                    .join(format!("monitor-test-{}.db", rand::random::<u64>()))
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            for suffix in ["", "-wal", "-shm", ".copy"] {
-                let _ = std::fs::remove_file(format!("{}{suffix}", self.0));
-            }
+            let dir = crate::TempDir::new("test");
+            Self(dir.0.join("monitor.db").to_string_lossy().into_owned(), dir)
         }
     }
 
@@ -2999,6 +3052,13 @@ mod tests {
         let kept =
             db.create_node(&Node { name: "backed-up".into(), ..Default::default() }, "token-kept").unwrap();
         db.backup_into(&copy).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for file in
+            [scratch.0.clone(), format!("{}-wal", scratch.0), format!("{}-shm", scratch.0), copy.clone()]
+        {
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{file} holds the node tokens");
+        }
 
         // Everything after the copy must disappear on restore.
         db.delete_node(kept).unwrap();
@@ -3023,8 +3083,20 @@ mod tests {
             SCHEMA_VERSION
         );
         assert_eq!(conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0)).unwrap(), "wal");
-        drop(conn);
-        let _ = std::fs::remove_file(&copy);
+    }
+
+    /// An unknown pragma is a silent no-op in SQLite, so only reading it back
+    /// shows the setting took.
+    #[test]
+    fn temporary_files_go_beside_the_database() {
+        let database = std::env::temp_dir().join("monitor.db");
+        temp_files_beside(&database.to_string_lossy()).unwrap();
+        let set: String = Connection::open_in_memory()
+            .unwrap()
+            .query_row("PRAGMA temp_store_directory", [], |r| r.get(0))
+            .unwrap();
+        // The parent, not `temp_dir()` itself, which keeps a trailing slash from TMPDIR.
+        assert_eq!(set, database.parent().unwrap().to_string_lossy());
     }
 
     /// The upload behind restore is an externally supplied file. Each case here
@@ -3087,6 +3159,13 @@ mod tests {
         refused("from a newer hub");
 
         newer.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}")).unwrap();
+        // Every table right, and SQL of the file's own that every later write
+        // would run.
+        newer
+            .execute_batch("CREATE TRIGGER t AFTER INSERT ON session BEGIN UPDATE node SET remark = 'x'; END")
+            .unwrap();
+        refused("a trigger beside the right tables");
+        newer.execute_batch("DROP TRIGGER t").unwrap();
         db.check_backup(&bad).unwrap();
     }
 
@@ -3537,9 +3616,8 @@ mod tests {
     /// deleted before anything is created keep their ids out of circulation.
     #[test]
     fn an_upgraded_database_does_not_reissue_the_newest_ids() {
-        let file = std::env::temp_dir().join(format!("monitor-marks-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&file);
-        let path = file.to_str().unwrap();
+        let scratch = Scratch::new();
+        let path = &scratch.0;
         let db = Db::open(path).unwrap();
         let (_, newest) = (node(&db, 1), node(&db, 1));
         let probe = |name: &str| PingTask {
@@ -3562,8 +3640,6 @@ mod tests {
         let other = node(&db, 1);
         let fresh = db.save_ping_task(&PingTask { nodes: vec![other], ..probe("osaka") }).unwrap();
         assert!(fresh > task, "the newest probe's id is issued again");
-        drop(db);
-        std::fs::remove_file(&file).unwrap();
     }
 
     /// An earlier build deleting a node or a probe runs only its own statements,
@@ -3987,12 +4063,19 @@ mod tests {
         let old = Utc::now().timestamp() - 40 * 86_400;
         db.insert_metric(id, old, &serde_json::json!({"cpu": 1.0})).unwrap();
         db.insert_metric(id, Utc::now().timestamp(), &serde_json::json!({"cpu": 2.0})).unwrap();
+        let detailed = Utc::now().timestamp() / 60 * 60 - 6 * 86_400;
+        db.insert_metric(id, detailed, &serde_json::json!({"cpu": 3.0})).unwrap();
 
         db.prune(30).unwrap();
-        assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 2, "unfolded minutes are kept");
+        assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 3, "unfolded minutes are kept");
         db.roll_up(Utc::now().timestamp(), 30).unwrap();
         db.prune(30).unwrap();
-        assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 1);
+        assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 2);
+        let kept: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM metric WHERE ts = ?1", [detailed], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "a folded minute within the week of detail stays");
         assert_eq!(db.all_traffic()[&id].total_rx, 800);
     }
 
@@ -4002,9 +4085,8 @@ mod tests {
     /// scans a node's entire history.
     #[test]
     fn rekeying_ping_record_keeps_the_rows_and_lets_the_chart_query_seek() {
-        let file = std::env::temp_dir().join(format!("monitor-rekey-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&file);
-        let path = file.to_str().unwrap();
+        let scratch = Scratch::new();
+        let path = &scratch.0;
 
         // A database as an older hub left it.
         let old = Connection::open(path).unwrap();
@@ -4048,7 +4130,6 @@ mod tests {
         drop(conn);
         drop(db);
         assert!(Db::open(path).is_ok());
-        let _ = std::fs::remove_file(&file);
     }
 
     /// Every row of every table, comparable across two opens of one file. A
@@ -4155,9 +4236,8 @@ mod tests {
     /// from being written.
     #[test]
     fn dropping_load1_keeps_the_history_and_lets_new_rows_in() {
-        let file = std::env::temp_dir().join(format!("monitor-load1-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&file);
-        let path = file.to_str().unwrap();
+        let scratch = Scratch::new();
+        let path = &scratch.0;
 
         // A database as a hub predating this build left it: one metric row
         // carrying a load average, stamped with the schema version of the time.
@@ -4189,7 +4269,6 @@ mod tests {
         // Opening again must not attempt to drop a column already removed.
         drop(db);
         assert!(Db::open(path).is_ok());
-        let _ = std::fs::remove_file(&file);
     }
 
     /// Removing a node from a probe must remove the probe from that node's chart.

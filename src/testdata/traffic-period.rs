@@ -72,6 +72,19 @@ fn delayed_old_reading_does_not_become_todays_future_period() {
 }
 
 #[test]
+fn invalid_period_slots_are_rejected_without_indexing_the_periods() {
+    let (db, node) = setup();
+    let now = Local::now();
+    db.accumulate(node, "boot", (0, 0), now, None).unwrap();
+    db.accumulate(node, "boot", (100, 200), now, None).unwrap();
+    db.conn().execute_batch("PRAGMA ignore_check_constraints=ON").unwrap();
+    for slot in [-1, 4, i64::MAX] {
+        db.conn().execute("UPDATE fork_traffic_period SET slot=?1", [slot]).unwrap();
+        assert!(db.traffic_periods(node, 1, now).is_err(), "invalid slot {slot}");
+    }
+}
+
+#[test]
 fn baseline_is_missing_history_but_observed_zero_is_a_record() {
     let (db, node) = setup();
     let at = Local::now();
